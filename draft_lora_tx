@@ -1,0 +1,571 @@
+#include "LoRaWan_APP.h"
+
+#include <driver/adc.h>
+#include <Arduino.h>
+
+/* Dallas Temperature Sensor Library */
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <microDS18B20.h>
+
+/* For calibration ADC */
+#include "esp_adc_cal.h"
+
+// Data wire is conntec to digital pin 4
+#define ONE_WIRE_BUS 4
+#define SENSOR_PIN_IN 19
+#define RELAY_PIN_OUT_1 48
+#define RELAY_PIN_OUT_2 47
+
+const float referenceVoltage = 3.3; // Voltage
+const int adcResolution = 4096;   // 12 bit
+
+#define uS_TO_S_FACTOR 1000000ULL  /* Conversion factor for micro seconds to seconds */
+#define TIME_TO_SLEEP  60         /* Time ESP32 will go to sleep (in seconds) 600 */
+#define TIMES_PER_DAY 43200          /* 24*60*60/15=5760 - each 15 seconds.  144 */
+
+/* Battery managment*/
+#define VBAT_PIN 1
+#define ADC_CTRL_PIN 37
+#define BATTERY_SAMPLES 20
+
+/* DS18B20 addresses (set the sensot address)*/
+
+/* For reading the address from sensor
+#include <microDS18B20.h>
+MicroDS18B20 <2> sensor;  // Создаем термометр без адреса на пине D2
+uint8_t address[8];       // Создаем массив для адреса
+void setup() {
+  Serial.begin(9600);
+}
+void loop() {
+  // читаем адрес термометра в указанный массив
+  if (sensor.readAddress(address)) {  // если успешно, выводим
+    Serial.print('{');
+    for (uint8_t i = 0; i < 8; i++) {
+      Serial.print("0x");
+      Serial.print(address[i], HEX);  // Выводим адрес
+      if (i < 7) Serial.print(", ");
+    }
+    Serial.println('}');
+  } else Serial.println("Not connected");
+  delay(1000);
+}
+*/
+
+/*
+License for the module, query ChipID relevant license https://resource.heltec.cn/search
+For the module “0x73F48AFC,0x795A2473,0xAC7793F7,0xE1112EC6”, the activation command is “AT+CDKEY=73F48AFC795A2473AC7793F7E1112EC6”.
+*/
+uint32_t license[4] = {0x73F48AFC, 0x795A2473, 0xAC7793F7, 0xE1112EC6};
+
+uint8_t s1Addr[] = {0x28, 0xFF, 0xCD, 0x59, 0x51, 0x17, 0x4, 0xFE};
+uint8_t s2Addr[] = {0x28, 0xFF, 0x36, 0x94, 0x65, 0x15, 0x2, 0x80};
+MicroDS18B20<ONE_WIRE_BUS, s1Addr> tempSensor1; //initializing sensor tempSensor1 with address s1Addr
+MicroDS18B20<ONE_WIRE_BUS, s2Addr> tempSensor2; //initializing sensor tempSensor2 with address s2Addr
+
+/* OTAA para*/
+uint8_t devEui[] = { 0x22, 0x32, 0x33, 0x00, 0x00, 0x88, 0x88, 0x02 };
+uint8_t appEui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77 };
+uint8_t appKey[] = { 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88 };
+
+/* ABP para*/
+uint8_t nwkSKey[] = { 0x15, 0xb1, 0xd0, 0xef, 0xa4, 0x63, 0xdf, 0xbe, 0x3d, 0x11, 0x18, 0x1e, 0x1e, 0xc7, 0xda,0x85 };
+uint8_t appSKey[] = { 0xd7, 0x2c, 0x78, 0x75, 0x8c, 0xdc, 0xca, 0xbf, 0x55, 0xee, 0x4a, 0x77, 0x8d, 0x16, 0xef,0x67 };
+uint32_t devAddr =  ( uint32_t )0x007e6ae1;
+
+/*LoraWan channelsmask, default channels 0-7*/ 
+uint16_t userChannelsMask[6]={ 0x00FF,0x0000,0x0000,0x0000,0x0000,0x0000 };
+
+/*LoraWan region, select in arduino IDE tools*/
+LoRaMacRegion_t loraWanRegion = ACTIVE_REGION;
+
+/*LoraWan Class, Class A and Class C are supported*/
+DeviceClass_t  loraWanClass = CLASS_A;
+
+/*the application data transmission duty cycle.  value in [ms].*/
+uint32_t appTxDutyCycle = 15000;
+
+/*OTAA or ABP*/
+bool overTheAirActivation = true;
+
+/*ADR enable*/
+bool loraWanAdr = true;
+
+/* Indicates if the node is sending confirmed or unconfirmed messages */
+bool isTxConfirmed = true;
+
+/* Application port */
+uint8_t appPort = 2;
+/*!
+* Number of trials to transmit the frame, if the LoRaMAC layer did not
+* receive an acknowledgment. The MAC performs a datarate adaptation,
+* according to the LoRaWAN Specification V1.0.2, chapter 18.4, according
+* to the following table:
+*
+* Transmission nb | Data Rate
+* ----------------|-----------
+* 1 (first)       | DR
+* 2               | DR
+* 3               | max(DR-1,0)
+* 4               | max(DR-1,0)
+* 5               | max(DR-2,0)
+* 6               | max(DR-2,0)
+* 7               | max(DR-3,0)
+* 8               | max(DR-3,0)
+*
+* Note, that if NbTrials is set to 1 or 2, the MAC will not decrease
+* the datarate, in case the LoRaMAC layer did not receive an acknowledgment
+*/
+uint8_t confirmedNbTrials = 4;
+
+float tempMaterial = 255;  //Material temperature
+float tempBox = 255;       //Temperature in box
+float sensorData = 0.0000;     // corrosive humidity sensore value
+int sensorValue = 0; // sensor value in range 0..4096 in DEC
+float voltage_value = 0; 
+int sensorValueHigh = 0; // two first numbers of sensor value in DEC
+int sensorValueLow = 0; // two larest numbers of sensor value in DEC
+
+RTC_DATA_ATTR int bootCount = 0;
+
+/* Colibration
+uint32_t readADC_Cal(int ADC_Raw)
+{
+  esp_adc_cal_characteristics_t adc_chars;
+  
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
+  return(esp_adc_cal_raw_to_voltage(ADC_Raw, &adc_chars));
+}
+
+// SNR 
+uint32_t readADC_Avg(int ADC_Raw)
+{
+  int i = 0;
+  uint32_t Sum = 0;
+  
+  AN_Pot1_Buffer[AN_Pot1_i++] = ADC_Raw;
+  if(AN_Pot1_i == FILTER_LEN)
+  {
+    AN_Pot1_i = 0;
+  }
+  for(i=0; i<FILTER_LEN; i++)
+  {
+    Sum += AN_Pot1_Buffer[i];
+  }
+  return (Sum/FILTER_LEN);
+}
+*/
+
+int readAverage(int samples) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(SENSOR_PIN_IN);
+  }
+  delay(10);
+  return sum / samples;
+}
+
+/* Prepares the payload of the frame */
+static void prepareTxFrame( uint8_t port )
+{
+  /*appData size is LORAWAN_APP_DATA_MAX_SIZE which is defined in "commissioning.h".
+  *appDataSize max value is LORAWAN_APP_DATA_MAX_SIZE.
+  *if enabled AT, don't modify LORAWAN_APP_DATA_MAX_SIZE, it may cause system hanging or failure.
+  *if disabled AT, LORAWAN_APP_DATA_MAX_SIZE can be modified, the max value is reference to lorawan region and SF.
+  *for example, if use REGION_CN470, 
+  *the max value for different DR can be found in MaxPayloadOfDatarateCN470 refer to DataratesCN470 and BandwidthsCN470 in "RegionCN470.h".
+  */
+
+    Serial.println("Preparing the frame");
+
+    //read data from sensors
+    //readTempSensor();
+    digitalWrite(RELAY_PIN_OUT_1, HIGH);
+    Serial.println("relay 1 ON");
+    digitalWrite(RELAY_PIN_OUT_2, HIGH);
+    Serial.println("relay 2 ON");
+    
+    delay(12000); // Dalay for stabilisations
+    //analogReference(INTERNAL);
+    // sensorValue = analogRead(SENSOR_PIN_IN);
+    //voltage_value = (sensorValue * 3.3 * 1000 ) / (4095);
+
+    //int val = adc1_get_raw(ADC1_CHANNEL_6);
+    adc2_config_width(ADC_WIDTH_BIT_12);
+
+    // Настройка канала, например, ADC2_CHANNEL_0 (GPIO4)
+    adc2_config_channel_atten(ADC2_CHANNEL_9, ADC_ATTEN_DB_11);
+    int raw_value = 0;
+    int val = adc2_get_raw(ADC2_CHANNEL_9, &raw_value);
+    int adcValue = readAverage(100);
+
+    float voltage_value = (adcValue * referenceVoltage) / adcResolution;
+    float mVoltage = voltage_value*1000;
+    int sensorValue = (int)mVoltage;
+
+    Serial.print("Voltage: ");
+    Serial.print(voltage_value);
+    Serial.println(" V");
+    Serial.print("Voltage 2: ");
+    Serial.print(sensorValue);
+    Serial.println(" mV");
+    Serial.print("GPIO20 ");
+    Serial.print(analogRead(1)*3.3/4096);
+    Serial.println(" V");
+
+    //Serial.print("Sensor value ");
+    //Serial.println(sensorValue);
+    //Serial.print("ADC Sensor value ");
+    //Serial.println(val * 3.3 / 4096);
+    delay(25);
+    digitalWrite(RELAY_PIN_OUT_1, LOW);
+    Serial.println("relay 1 OFF");
+    digitalWrite(RELAY_PIN_OUT_2, LOW);
+    Serial.println("relay 2 OFF");
+
+
+    float voltage = readBattVoltage();
+    //Serial.println(voltage * 3.3 / 1024);
+    Serial.println("Battery voltage: " + String(readBattVoltage()) + "V");
+
+    if (tempBox <= 0 && tempBox > 125)
+    {
+      tempBox == 222;
+    }
+    if (tempMaterial <= 0 && tempMaterial > 125)
+    {
+      tempMaterial == 222;
+    }
+
+    appDataSize = 32;
+    appData[0] = 0x2a;                      // 1
+    appData[1] = 0x00;                      // 2
+    appData[2] = 0x00;                      // 3
+    appData[3] = 0x00;                      // 4
+    appData[4] = 0x00;                      // 5
+    appData[5] = 0x00;                      // 6
+    appData[6] = 0x00;                      // 7
+    appData[7] = 0x00;                      // 8
+    appData[8] = 0x00;                      // 9
+    appData[9] = 0x00;                      // 10
+    appData[10] = 0x00;                     // 11
+    
+    // sensor value 
+    sensorValueHigh = sensorValue / 100;
+    sensorValueLow = sensorValue % 100;
+    appData[11] = sensorValueHigh;          // 12
+    appData[12] = sensorValueLow;           // 13
+    appData[13] = tempMaterial;             // 14
+    appData[14] = 0x00;                     // 15
+    appData[15] = tempBox;                  // 16
+    //uint16_t voltageTX = voltage * 1000;
+    uint16_t voltageTXHigh = voltage / 100;
+    uint16_t voltageTXLow = (int) voltage % 100;
+    appData[16] = voltageTXHigh;
+    appData[17] = voltageTXLow;
+    appData[18] = 0x00;
+    appData[19] = 0x00;
+    appData[20] = 0x00;
+    appData[21] = 0x00;
+    appData[22] = 0x00;
+    appData[23] = 0x00;
+    appData[24] = 0x00;
+    appData[25] = 0x00;
+    appData[26] = 0x00;
+    appData[27] = 0x00;
+    appData[28] = 0x00;
+    appData[29] = 0x00;
+    appData[30] = 0x00;
+    appData[31] = 0x00;
+
+    for (int i = 0; i < 32; i++)
+    {
+      Serial.print(String(appData[i]));
+    }
+    Serial.println();
+}
+
+void enterDeepSleep() {
+    Serial.println("Entering deep sleep...");
+    
+    esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+    esp_deep_sleep_start();
+    //LoRaWAN.sleep(loraWanClass);
+}
+
+//if true, next uplink will add MOTE_MAC_DEVICE_TIME_REQ 
+
+/* read temperature values */
+int readTempSensor()
+{
+  tempSensor1.requestTemp();
+  tempSensor2.requestTemp();
+  delay(1000); // waiting the data from the sensors
+  if (tempSensor1.readTemp())
+  {
+    tempMaterial == tempSensor1.getTemp();
+    Serial.println(tempSensor1.getTemp());
+  }
+  else Serial.println("error");
+
+  if (tempSensor2.readTemp())
+  {
+    tempBox == tempSensor2.getTemp();
+    Serial.println(tempSensor2.getTemp());
+  } 
+  else Serial.println("error");
+}
+/*
+int readSensor()
+{
+  digitalWrite(RELAY_PIN_OUT, HIGH);
+  delay(100);
+  sensorValue = analogRead(SENSOR_PIN_IN);
+  delay(25);
+  digitalWrite(RELAY_PIN_OUT, LOW);
+}
+*/
+
+/* Method to print the reason by which ESP32 has been awaken from sleep */
+void print_wakeup_reason(){
+  esp_sleep_wakeup_cause_t wakeup_reason;
+
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  switch(wakeup_reason)
+  {
+    case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+    case ESP_SLEEP_WAKEUP_EXT1 : Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
+    case ESP_SLEEP_WAKEUP_TIMER : Serial.println("Wakeup caused by timer"); break;
+    case ESP_SLEEP_WAKEUP_TOUCHPAD : Serial.println("Wakeup caused by touchpad"); break;
+    case ESP_SLEEP_WAKEUP_ULP : Serial.println("Wakeup caused by ULP program"); break;
+    default : Serial.printf("Wakeup was not caused by deep sleep: %d\n",wakeup_reason); break;
+  }
+}
+
+/* Battery managment start*/
+void VBAT_Init()
+{
+  pinMode(VBAT_PIN, INPUT);
+  pinMode(ADC_CTRL_PIN, OUTPUT);
+}
+/*
+int16_t readBatteryVoltage() {
+  // ADC resolution
+  const int resolution = 12;
+  const int adcMax = pow(2,resolution) - 1;
+  const float adcMaxVoltage = 3.3;
+  // On-board voltage divider
+  const int R1 = 390;
+  const int R2 = 100;
+  // Calibration measurements
+  const float measuredVoltage = 4.2;
+  const float reportedVoltage = 4.095;
+  // Calibration factor
+  const float factor = (adcMaxVoltage / adcMax) * ((R1 + R2)/(float)R2) * (measuredVoltage / reportedVoltage);
+ 
+  digitalWrite(ADC_CTRL_PIN, LOW);
+  delay(100);
+
+  uint32_t raw = 0;
+  for (int i = 0; i < BATTERY_SAMPLES; i++)
+  {
+      raw += analogRead(VBAT_PIN);
+  }
+
+  raw = raw / BATTERY_SAMPLES;
+  digitalWrite(ADC_CTRL_PIN, HIGH);
+
+  float floatVoltage = factor * raw;
+  voltage = (int)(floatVoltage * 1000.0);
+
+  Serial.println(String(floatVoltage));
+  Serial.println(String(voltage));
+
+  return voltage;
+
+
+  return 0
+}
+*/
+float readBattVoltage()
+{
+
+  // ADC resolution
+  const int resolution = 12;
+  const int adcMax = pow(2,resolution) - 1;
+  const float adcMaxVoltage = 3.3;
+  // On-board voltage divider
+  const int R1 = 390;
+  const int R2 = 100;
+  // Calibration measurements
+  const float measuredVoltage = 4.2;
+  const float reportedVoltage = 4.095;
+  // Calibration factor
+  const float factor = (adcMaxVoltage / adcMax) * ((R1 + R2)/(float)R2) * (measuredVoltage / reportedVoltage); 
+
+  digitalWrite(ADC_CTRL_PIN, LOW);
+  delay(100);
+
+  uint32_t raw = 0;
+  for (int i = 0; i < BATTERY_SAMPLES; i++)
+  {
+    raw += analogRead(VBAT_PIN);
+  }
+  raw = raw / BATTERY_SAMPLES;
+  //Serial.println(raw);
+  digitalWrite(ADC_CTRL_PIN, HIGH);
+
+  float floatVoltageFactor = factor * raw;
+  uint16_t voltageFactor = (int)(floatVoltageFactor * 1000.0);
+
+  //Serial.print("floatVoltageFactor: ");
+  //Serial.println(floatVoltageFactor);
+  //Serial.print("voltageFactor: ");
+  //Serial.println(voltageFactor);
+
+  //Serial.print("Raw: ");
+  //Serial.println((3.3 / 1024.0) * raw + 1);
+
+  //return 5.42 * (3.3 / 1024.0) * raw;
+  return voltageFactor;
+}
+/* Battery managment end*/
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  VBAT_Init();
+
+  //Increment boot number and print it every reboot
+  ++bootCount;
+  Serial.println("Boot number: " + String(bootCount));
+
+  //Print the wakeup reason for ESP32
+  print_wakeup_reason();
+
+  /* Firstly configure the wake up source. Set our ESP32 to wake up every 600 seconds*/
+  // esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  // Serial.println("Setup ESP32 to sleep for every " + String(TIME_TO_SLEEP) + " seconds");
+
+  if (bootCount % 2 == 0){
+    Serial.println("Entering deep sleep...");
+    enterDeepSleep();
+  } 
+
+  pinMode(SENSOR_PIN_IN, INPUT);
+  pinMode(1, INPUT);
+
+  pinMode(RELAY_PIN_OUT_1, OUTPUT);
+  pinMode(RELAY_PIN_OUT_2, OUTPUT);
+
+//  adc1_config_width(ADC_WIDTH_BIT_12); // ADC bits 0-4095
+//  adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_0); //value level,150 .. 1750 mV
+
+  adc1_config_width(ADC_WIDTH_12Bit);//ADC bits 0-4095
+  adc1_config_channel_atten(ADC1_CHANNEL_6,ADC_ATTEN_DB_11); 
+
+  Mcu.begin();
+  deviceState = DEVICE_STATE_INIT;
+
+}
+
+// Reason to wake up
+esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+int timer_to_sleep = 0;
+
+void loop()
+{
+  switch( deviceState )
+  {
+    case DEVICE_STATE_INIT:
+    {
+      Serial.print("==========");
+      Serial.print("Init state");
+      Serial.print("==========");
+#if(LORAWAN_DEVEUI_AUTO)
+      LoRaWAN.generateDeveuiByChipID();
+#endif
+      LoRaWAN.init(loraWanClass,loraWanRegion);
+      break;
+    }
+    case DEVICE_STATE_JOIN:
+    {
+      Serial.print("==========");
+      Serial.print("Join state");
+      Serial.print("==========");
+      LoRaWAN.join();
+      deviceState = DEVICE_STATE_SEND;
+      break;
+    }
+    case DEVICE_STATE_SEND:
+    {
+      // int tCrowling = 5760 / TIMES_PER_DAY;
+      // if( bootCount == 1 || bootCount % tCrowling == 0 )
+      // {
+      //   prepareTxFrame( appPort );
+      //   LoRaWAN.send();
+      // }
+      prepareTxFrame( appPort );
+      LoRaWAN.send();
+      deviceState = DEVICE_STATE_CYCLE;
+      break;
+    }
+    case DEVICE_STATE_CYCLE:
+    {
+      Serial.print("=============");
+      Serial.print("Cycling state");
+      Serial.println("=============");
+      //Serial.println("Cycling state");
+      // Schedule next packet transmission
+      txDutyCycleTime = appTxDutyCycle + randr( -APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND );
+      LoRaWAN.cycle(txDutyCycleTime);
+      timer_to_sleep = millis();
+      Serial.println(timer_to_sleep);
+      deviceState = DEVICE_STATE_SLEEP;
+      break;
+    }
+    case DEVICE_STATE_SLEEP:
+    {
+      // Deep Sleep
+      // if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) {
+      //   Serial.println("Going to sleep for 10 sec...");
+      //   esp_sleep_enable_timer_wakeup(10 * 1000000ULL); // Устанавливаем таймер на 10 секунд
+      //   esp_deep_sleep_start();
+      // } else {
+      //   Serial.println("Going back to sleep...");
+      //   esp_sleep_enable_timer_wakeup(10 * 1000000ULL); // Устанавливаем таймер на 10 секунд
+      //   esp_deep_sleep_start();
+      // }
+      LoRaWAN.sleep(loraWanClass);
+
+      // while (millis() > timer_to_sleep + 12000){
+      //   Serial.println("Waiting");
+      //   Serial.println(millis());
+      //   Serial.println("===========");
+      //   Serial.println("Sleep state");
+      //   Serial.println("===========");
+      //   enterDeepSleep();
+      // }
+      
+      //LoRaWAN.sleep(loraWanClass);
+      //enterDeepSleep();
+      break;
+    }
+    default:
+    {
+      Serial.print("=============");
+      Serial.print("Default state");
+      Serial.print("=============");
+      deviceState = DEVICE_STATE_INIT;
+      break;
+    }
+  }
+
+  //Serial.println("Going to sleep now");
+  //Serial.flush(); 
+  //esp_deep_sleep_start();
+}
